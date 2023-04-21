@@ -38,6 +38,15 @@ from absl.flags import argparse_flags
 import tensorflow as tf
 import tensorflow_compression as tfc
 import tensorflow_datasets as tfds
+import torch
+import numpy as np
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_optimizer import Lamb
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard.writer import SummaryWriter
+from torchvision import transforms
+import torch.nn.init as init
 
 
 def read_png(filename):
@@ -51,13 +60,168 @@ def write_png(filename, image):
   string = tf.image.encode_png(image)
   tf.io.write_file(filename, string)
 
+class Normalize(nn.Module):
+    def __init__(self, factor):
+        super(Normalize, self).__init__()
+        self.factor = factor
+
+    def forward(self, x):
+        return x / self.factor
+
+class Denormalize(nn.Module):
+    def __init__(self, factor):
+        super(Denormalize, self).__init__()
+        self.factor = factor
+
+    def forward(self, x):
+        return x * self.factor
+
+class GDN(nn.Module):
+    def __init__(self,
+                 inverse=False,
+                 rectify=False,
+                 data_format="channels_last",
+                 alpha_parameter=1,
+                 beta_parameter=None,
+                 gamma_parameter=None,
+                 epsilon_parameter=1,
+                 alpha_initializer="ones",
+                 beta_initializer="ones",
+                 gamma_initializer=None,
+                 epsilon_initializer="ones"):
+        super().__init__()
+
+        self.inverse = inverse
+        self.rectify = rectify
+        self.data_format = data_format
+        self.alpha_parameter = alpha_parameter
+        self.beta_parameter = beta_parameter
+        self.gamma_parameter = gamma_parameter
+        self.epsilon_parameter = epsilon_parameter
+
+        if gamma_initializer is None:
+            self.gamma_initializer = lambda tensor: init.eye_(tensor) * 0.1
+        else:
+            self.gamma_initializer = gamma_initializer
+
+        self.alpha_initializer = getattr(init, alpha_initializer + "_")
+        self.beta_initializer = getattr(init, beta_initializer + "_")
+        self.epsilon_initializer = getattr(init, epsilon_initializer + "_")
+
+    def _channel_axis(self):
+        return {"channels_first": 1, "channels_last": -1}[self.data_format]
+
+    def forward(self, inputs):
+        if not hasattr(self, 'beta'):
+            num_channels = inputs.size(self._channel_axis())
+            self.alpha = self.alpha_initializer(torch.empty((), dtype=torch.float32))
+            self.beta = self.beta_initializer(torch.empty(num_channels, dtype=torch.float32))
+            self.gamma = self.gamma_initializer(torch.empty(num_channels, num_channels, dtype=torch.float32))
+            self.epsilon = self.epsilon_initializer(torch.empty((), dtype=torch.float32))
+
+        if self.rectify:
+            inputs = F.relu(inputs)
+
+        if self.alpha == 1 and self.rectify:
+            norm_pool = inputs
+        elif self.alpha == 1:
+            norm_pool = torch.abs(inputs)
+        elif self.alpha == 2:
+            norm_pool = torch.square(inputs)
+        else:
+            norm_pool = inputs ** self.alpha
+
+        if inputs.dim() == 2:
+            norm_pool = torch.matmul(norm_pool, self.gamma)
+            norm_pool = norm_pool + self.beta
+        else:
+            gamma = self.gamma.view(inputs.dim() - 2, *self.gamma.size())
+            norm_pool = F.conv2d(norm_pool, gamma, padding=0)
+            norm_pool = norm_pool + self.beta
+
+        if self.epsilon == 1:
+            pass
+        elif self.epsilon == 0.5:
+            norm_pool = torch.sqrt(norm_pool)
+        else:
+            norm_pool = norm_pool ** self.epsilon
+
+        if self.inverse:
+            return inputs * norm_pool
+        else:
+            return inputs / norm_pool
+
+class Encoder(nn.Sequential):
+    """The analysis transform."""
+    def __init__(self, num_filters):
+        super().__init__(
+            nn.Conv2d(3, num_filters, kernel_size=9, stride=4, padding=4, bias=True),
+            GDN(),
+            nn.Conv2d(num_filters, num_filters, kernel_size=5, stride=2, padding=2, bias=True),
+            GDN(),
+            nn.Conv2d(num_filters, num_filters, kernel_size=5, stride=2, padding=2, bias=False)
+        )
+
+class Decoder(nn.Sequential):
+    """The synthesis transform."""
+    def __init__(self, num_filters):
+        super().__init__(
+            nn.ConvTranspose2d(num_filters, num_filters, kernel_size=5, stride=2, padding=2, output_padding=1, bias=True),
+            GDN(inverse=True),
+            nn.ConvTranspose2d(num_filters, num_filters, kernel_size=5, stride=2, padding=2, output_padding=1, bias=True),
+            GDN(inverse=True),
+            nn.ConvTranspose2d(num_filters, 3, kernel_size=9, stride=4, padding=4, output_padding=3, bias=True),
+            Denormalize(255.0)
+        )
+
+class PTAutoencoder(nn.Module):
+    def __init__(self, num_filters):
+        super(PTAutoencoder, self).__init__()
+        self.encoder = Encoder(num_filters)
+        self.decoder = Decoder(num_filters)
+
+    def forward(self, x):
+        encoded = self.encoder(x)
+        decoded = self.decoder(encoded)
+        return decoded
+
+class TFAutoencoder(tf.keras.Model):
+    def __init__(self, num_filters):
+        super(TFAutoencoder, self).__init__()
+        self.encoder = AnalysisTransform(num_filters)
+        self.decoder = SynthesisTransform(num_filters)
+
+    def call(self, inputs):
+        encoded = self.encoder(inputs)
+        decoded = self.decoder(encoded)
+        return decoded
+
+def test_models(input_data, num_filters=64):
+    # Convert input data to PyTorch tensor and TensorFlow tensor
+    pt_input = torch.tensor(input_data, dtype=torch.float32)
+    tf_input = tf.convert_to_tensor(input_data, dtype=tf.float32)
+
+    # Create autoencoders
+    pt_autoencoder = PTAutoencoder(num_filters)
+    tf_autoencoder = TFAutoencoder(num_filters)
+
+    # Get the outputs
+    pt_output = pt_autoencoder(pt_input).detach().numpy()
+    tf_output = tf_autoencoder(tf_input).numpy()
+
+    # Compare outputs
+    diff = np.abs(pt_output - tf_output)
+    print(f'Mean Absolute Difference: {np.mean(diff)}')
 
 class AnalysisTransform(tf.keras.Sequential):
   """The analysis transform."""
 
   def __init__(self, num_filters):
     super().__init__(name="analysis")
+    # 1. Input image is divided by 255 to normalize the pixel values between 0 and 1
     self.add(tf.keras.layers.Lambda(lambda x: x / 255.))
+
+    # 2. Convolution layers to extract information from the input image
     self.add(tfc.SignalConv2D(
         num_filters, (9, 9), name="layer_0", corr=True, strides_down=4,
         padding="same_zeros", use_bias=True,
@@ -98,8 +262,10 @@ class BLS2017Model(tf.keras.Model):
   def __init__(self, lmbda, num_filters):
     super().__init__()
     self.lmbda = lmbda
-    self.analysis_transform = AnalysisTransform(num_filters)
-    self.synthesis_transform = SynthesisTransform(num_filters)
+
+    self.analysis_transform = AnalysisTransform(num_filters)   # encoder
+    self.synthesis_transform = SynthesisTransform(num_filters) # decoder
+
     self.prior = tfc.NoisyDeepFactorized(batch_shape=(num_filters,))
     self.build((None, None, None, 3))
 
@@ -108,9 +274,13 @@ class BLS2017Model(tf.keras.Model):
     entropy_model = tfc.ContinuousBatchedEntropyModel(
         self.prior, coding_rank=3, compression=False)
     x = tf.cast(x, self.compute_dtype)  # TODO(jonycgn): Why is this necessary?
-    y = self.analysis_transform(x)
+
+    # VAE
+
+    y = self.analysis_transform(x)          # the encoder 
     y_hat, bits = entropy_model(y, training=training)
-    x_hat = self.synthesis_transform(y_hat)
+    x_hat = self.synthesis_transform(y_hat) # the decoder
+
     # Total number of bits divided by total number of pixels.
     num_pixels = tf.cast(tf.reduce_prod(tf.shape(x)[:-1]), bits.dtype)
     bpp = tf.reduce_sum(bits) / num_pixels
@@ -448,4 +618,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-  app.run(main, flags_parser=parse_args)
+  # app.run(main, flags_parser=parse_args)
+    for i in range(100):
+        input_data = np.random.rand(1, 3, 256, 256)
+        test_models(input_data)
