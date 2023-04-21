@@ -93,7 +93,6 @@ class GDN(nn.Module):
 
         self.inverse = inverse
         self.rectify = rectify
-        self.data_format = data_format
         self.alpha_parameter = alpha_parameter
         self.beta_parameter = beta_parameter
         self.gamma_parameter = gamma_parameter
@@ -108,12 +107,9 @@ class GDN(nn.Module):
         self.beta_initializer = getattr(init, beta_initializer + "_")
         self.epsilon_initializer = getattr(init, epsilon_initializer + "_")
 
-    def _channel_axis(self):
-        return {"channels_first": 1, "channels_last": -1}[self.data_format]
-
     def forward(self, inputs):
         if not hasattr(self, 'beta'):
-            num_channels = inputs.size(self._channel_axis())
+            num_channels = inputs.size(1)
             self.alpha = self.alpha_initializer(torch.empty((), dtype=torch.float32))
             self.beta = self.beta_initializer(torch.empty(num_channels, dtype=torch.float32))
             self.gamma = self.gamma_initializer(torch.empty(num_channels, num_channels, dtype=torch.float32))
@@ -131,13 +127,14 @@ class GDN(nn.Module):
         else:
             norm_pool = inputs ** self.alpha
 
-        if inputs.dim() == 2:
-            norm_pool = torch.matmul(norm_pool, self.gamma)
-            norm_pool = norm_pool + self.beta
-        else:
-            gamma = self.gamma.view(inputs.dim() - 2, *self.gamma.size())
-            norm_pool = F.conv2d(norm_pool, gamma, padding=0)
-            norm_pool = norm_pool + self.beta
+        # Ensure the gamma tensor has the same dimension as the input tensor
+        gamma_expanded = self.gamma.view(1, *self.gamma.size(), 1, 1)
+
+        # Apply the gamma tensor to the norm pool
+        norm_pool = F.conv2d(norm_pool, gamma_expanded, padding=0, groups=num_channels)
+
+        # Add the beta tensor to the norm pool
+        norm_pool = norm_pool + self.beta.view(1, -1, 1, 1)
 
         if self.epsilon == 1:
             pass
